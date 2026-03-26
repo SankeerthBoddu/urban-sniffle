@@ -8,3 +8,24 @@ References:
 - Terraform dependency graph internals: https://developer.hashicorp.com/terraform/internals/graph
 - HashiCorp Discuss, dependencies are between whole resource blocks, not individual instances: https://discuss.hashicorp.com/t/dependency-graph-bottleneck/48057
 - HashiCorp Discuss, graph/dependency behavior with counted instances: https://discuss.hashicorp.com/t/terraform-depends-on-and-count-elements/55786/2
+
+--------------------
+
+This refactor won't actually work here. I ran into this exact problem while building this out.
+
+The idea of collapsing the separate level_0, level_1, level_2 resources into one google_folder resource with count or for_each makes sense when you read it, but Terraform doesn't evaluate it the way we'd expect. When you have instance [2] referencing [1], and [1] referencing [0], Terraform doesn't see that as an ordered chain — it sees one resource block referencing itself, which creates a cycle. I actually hit this exact error when I first tried it:
+
+ERROR: Cycle: google_folder.dynamic_folders["2"],
+              google_folder.dynamic_folders["1"],
+              google_folder.dynamic_folders["0"]
+			  
+The reason is that Terraform's dependency graph tracks dependencies between whole resource blocks, not between individual instances within the same block. So google_folder.dynamic_folders depending on google_folder.dynamic_folders is a circular reference, full stop — regardless of the instance index.
+
+The separate per-level resources are intentional. Each one is its own block in the graph, so Terraform can build a clean dependency chain: level_0 → level_1 → level_2. That's the only way to express "create this folder, then use its ID as the parent for the next one" without hitting a cycle.
+
+I know it looks like duplication, but it's the correct pattern for this kind of hierarchical creation in Terraform. 
+
+Some references:
+https://developer.hashicorp.com/terraform/internals/graph
+https://discuss.hashicorp.com/t/dependency-graph-bottleneck/48057
+https://discuss.hashicorp.com/t/terraform-depends-on-and-count-elements/55786/2
