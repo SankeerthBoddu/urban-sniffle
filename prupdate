@@ -1,0 +1,10 @@
+This refactor won’t work in Terraform because the proposed refactor relies on a Terraform pattern that does not work for this kind of hierarchy. A count or for_each resource can create multiple instances, but Terraform does not model dependencies between those instances as an ordered chain; it builds the dependency graph first, and those dependencies are tracked between whole resource blocks rather than “instance 2 depends on instance 1.”
+
+In this case, the suggested pattern would make google_folder.dynamic_folders derive each folder’s parent from another instance of google_folder.dynamic_folders. Although that reads correctly to a person, Terraform interprets it as the resource block depending on itself, which creates a cycle rather than a valid parent-child sequence.
+
+That is why the explicit level_0, level_1, level_2, etc. resources are intentional here. Separate resource blocks let Terraform represent the hierarchy as a valid dependency chain, while a single counted resource cannot safely express “instance N depends on instance N-1” for folder creation.
+
+References:
+- Terraform dependency graph internals: https://developer.hashicorp.com/terraform/internals/graph
+- HashiCorp Discuss, dependencies are between whole resource blocks, not individual instances: https://discuss.hashicorp.com/t/dependency-graph-bottleneck/48057
+- HashiCorp Discuss, graph/dependency behavior with counted instances: https://discuss.hashicorp.com/t/terraform-depends-on-and-count-elements/55786/2
