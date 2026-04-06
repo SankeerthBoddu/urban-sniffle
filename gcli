@@ -1,0 +1,168 @@
+param (
+    [Parameter(Mandatory=$false)]
+    [string]$FolderId,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OrganizationId,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputFile = "GCP_Projects_Report_$((Get-Date).ToString('yyyyMMdd_HHmmss')).csv"
+)
+
+if (-not $FolderId -and -not $OrganizationId) {
+    Write-Error "Please provide either -FolderId (e.g. '12345678') or -OrganizationId (e.g. '87654321')"
+    Write-Host "Usage Example:" -ForegroundColor Cyan
+    Write-Host ".\Export-GCPHierarchy.ps1 -FolderId `"660695939569`"" -ForegroundColor Yellow
+    exit 1
+}
+
+if ($FolderId -and $OrganizationId) {
+    Write-Error "Please provide ONLY -FolderId OR -OrganizationId, not both."
+    exit 1
+}
+
+# Function to get projects recursively
+function Get-GcpProjectsRecursive {
+    param (
+        [string]$ParentId,
+        [string]$ParentType, # 'folder' or 'organization'
+        [string]$FolderPath
+    )
+    
+    $results = @()
+    
+    Write-Host "Scanning $ParentType: $FolderPath (ID: $ParentId)" -ForegroundColor Cyan
+    
+    # 1. Get immediate projects
+    # We suppress standard errors using 2>$null to keep output clean, but it's optional
+    $projectsJson = gcloud projects list --filter="parent.id:$ParentId AND parent.type:$ParentType" --format="json" | Out-String
+    if (-not [string]::IsNullOrWhiteSpace($projectsJson)) {
+        try {
+            $projects = $projectsJson | ConvertFrom-Json
+            if ($projects) {
+                # Ensure array wrapper for iteration if only 1 project
+                $projects = @($projects)
+                foreach ($proj in $projects) {
+                    $projData = @{
+                        FolderPath  = $FolderPath
+                        ProjectName = $proj.name
+                        ProjectId   = $proj.projectId
+                        State       = $proj.lifecycleState
+                        CreateTime  = $proj.createTime
+                        Labels      = $proj.labels
+                    }
+                    $results += [PSCustomObject]$projData
+                    Write-Host "  Found Project: $($proj.projectId)" -ForegroundColor Green
+                }
+            }
+        } catch {
+            Write-Warning "Failed to parse projects from $ParentType $ParentId."
+        }
+    }
+    
+    # 2. Get immediate subfolders
+    $foldersJson = ""
+    if ($ParentType -eq 'organization') {
+        $foldersJson = gcloud resource-manager folders list --organization=$ParentId --format="json" | Out-String
+    } else {
+        $foldersJson = gcloud resource-manager folders list --folder=$ParentId --format="json" | Out-String
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($foldersJson)) {
+        try {
+            $folders = $foldersJson | ConvertFrom-Json
+            if ($folders) {
+                $folders = @($folders)
+                foreach ($folder in $folders) {
+                    $folderId = $folder.name -replace "folders/", ""
+                    $subFolderPath = "$FolderPath > $($folder.displayName)"
+                    
+                    # Recurse into this folder
+                    $results += Get-GcpProjectsRecursive -ParentId $folderId -ParentType "folder" -FolderPath $subFolderPath
+                }
+            }
+        } catch {
+            Write-Warning "Failed to parse folders from $ParentType $ParentId."
+        }
+    }
+    
+    return $results
+}
+
+# Execution starts here
+$rootId = if ($FolderId) { $FolderId } else { $OrganizationId }
+$rootType = if ($FolderId) { "folder" } else { "organization" }
+
+Write-Host "`nStarting GCP Hierarchy Export from $rootType: $rootId" -ForegroundColor Yellow
+Write-Host "Warning: This might take a few minutes for deep hierarchies with many folders..." -ForegroundColor Gray
+
+# Try getting root folder or org name for nice path formatting
+$rootDisplayName = $rootId
+if ($rootType -eq 'folder') {
+    try {
+        $rootInfoJson = gcloud resource-manager folders describe $rootId --format="json" | Out-String | ConvertFrom-Json
+        if ($rootInfoJson -and $rootInfoJson.displayName) { $rootDisplayName = $rootInfoJson.displayName }
+    } catch { }
+} else {
+    # Organization
+    try {
+        $rootInfoJson = gcloud organizations describe $rootId --format="json" | Out-String | ConvertFrom-Json
+        if ($rootInfoJson -and $rootInfoJson.displayName) { $rootDisplayName = $rootInfoJson.displayName }
+    } catch { }
+}
+
+# Begin recursive scan
+$allProjects = Get-GcpProjectsRecursive -ParentId $rootId -ParentType $rootType -FolderPath $rootDisplayName
+
+if ($allProjects.Count -gt 0) {
+    Write-Host "`nProcessing $($allProjects.Count) projects to build Excel-friendly CSV report..." -ForegroundColor Yellow
+    
+    # Identify every unique label key used across ALL found projects
+    $allLabelKeys = @()
+    foreach ($proj in $allProjects) {
+        if ($proj.Labels) {
+            foreach ($prop in $proj.Labels.psobject.properties) {
+                if ($allLabelKeys -notcontains $prop.Name) {
+                    $allLabelKeys += $prop.Name
+                }
+            }
+        }
+    }
+    
+    # Sort label keys alphabetically for consistent column ordering
+    $allLabelKeys = $allLabelKeys | Sort-Object
+    
+    # Build a flat data list suitable for a CSV/Spreadsheet
+    $exportData = @()
+    foreach ($proj in $allProjects) {
+        # Initialize an ordered dictionary to keep standard columns first
+        $flatRecord = [ordered]@{
+            "Folder Hierarchy" = $proj.FolderPath
+            "Project Name"     = $proj.ProjectName
+            "Project ID"       = $proj.ProjectId
+            "State"            = $proj.State
+            "Created At"       = $proj.CreateTime
+        }
+        
+        # Unpack each potential label. It will be blank if the project doesn't have it.
+        foreach ($labelKey in $allLabelKeys) {
+            $labelVal = ""
+            if ($proj.Labels -and $proj.Labels.psobject.properties.Match($labelKey).Count -gt 0) {
+                $labelVal = $proj.Labels.$labelKey
+            }
+            # Prefix column header with 'Label: ' so it's clear in the spreadsheet
+            $flatRecord["Label: $labelKey"] = $labelVal
+        }
+        
+        $exportData += [PSCustomObject]$flatRecord
+    }
+    
+    # Export to CSV
+    $exportData | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+    
+    Write-Host "`nSUCCESS! Exported $($allProjects.Count) GCP projects." -ForegroundColor Green
+    Write-Host "Report saved to: $(Resolve-Path $OutputFile)" -ForegroundColor Green
+    Write-Host "Tip: Open this CSV in Excel and 'Format as Table' to easily filter by Hierarchy or Labels." -ForegroundColor Cyan
+} else {
+    Write-Host "`nNo projects found under $rootType $rootId." -ForegroundColor Yellow
+}
