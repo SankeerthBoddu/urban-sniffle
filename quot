@@ -34,8 +34,63 @@ output "quota_override_details" {
     for k, v in google_cloud_quotas_quota_preference.preference : k => {
       id             = v.id
       request_number = try(v.quota_config[0].trace_id, null)
-      status         = try(v.quota_config[0].state_detail, null)
+      raw_status     = try(v.quota_config[0].state_detail, null)
       granted_value  = try(v.quota_config[0].granted_value, null)
+      
+      # --- Usable Actionable Checks ---
+      # Evaluates if the value granted by the API matches what we requested
+      is_updated     = tostring(try(v.quota_config[0].granted_value, "")) == tostring(try(v.quota_config[0].preferred_value, "unmatched"))
+      
+      # Clear ENUM style status for your CloudHub/DTO parsing
+      summary_status = try(v.reconciling, false) ? "PROCESSING" : (
+        tostring(try(v.quota_config[0].granted_value, "")) == tostring(try(v.quota_config[0].preferred_value, "unmatched")) ? "APPLIED" : "PENDING_GCP_REVIEW"
+      )
     }
   }
 }
+
+
+Now, for every quota passed in, the map will provide:
+
+is_updated: A simple true/false boolean. I implemented this by actively evaluating if the value Google has granted identically matches the value you preferred.
+summary_status: A clean string ENUM that your frontend / portal can parse smoothly.
+"PROCESSING" (if Terraform is actively talking to the backend)
+"APPLIED" (if granted == preferred)
+"PENDING_GCP_REVIEW" (if the value hasn't updated yet, meaning a ticket was automatically cut off to Google Support)
+This makes verifying quota enablement incredibly precise without relying on unstable string processing!
+
+consumer_quotas = [
+  # ---------------------------------------------------------------------------------
+  # TEST 1: AUTO-APPROVED ("APPLIED")
+  # Requesting a very small, standard N1/E2 CPU quota increase. GCP's automated 
+  # systems typically evaluate this instantly, granting the value immediately without
+  # generating a support ticket.
+  # Expected Output: is_updated = true, summary_status = "APPLIED"
+  # ---------------------------------------------------------------------------------
+  {
+    service       = "compute.googleapis.com"
+    dimension     = { region = "us-west3" }
+    quota_id      = "CPUS-per-project-region"   # Standard CPUs
+    value         = 12                         # Small limit
+    contact_email = "pinki.mandal@citi.com"
+    name          = "compute-cpus-standard-test-01"
+  },
+  
+  # ---------------------------------------------------------------------------------
+  # TEST 2: MANUAL REVIEW ("PENDING_GCP_REVIEW")
+  # Requesting massive amounts of A2 CPUs (scarce, GPU-bound hardware). This will 
+  # absolutely trip Google's risk/capacity checks, requiring human review. It will 
+  # finish Terraform execution, but leave the quota state pending.
+  # Expected Output: is_updated = false, summary_status = "PENDING_GCP_REVIEW", request_number = "trace_id_ticket_xyz"
+  # ---------------------------------------------------------------------------------
+  {
+    service       = "compute.googleapis.com"
+    dimension     = { region = "us-west3" }
+    quota_id      = "A2-CPUS-per-project-region" # Highly restricted A2 resources
+    value         = 500                          # Massive request
+    contact_email = "pinki.mandal@citi.com"
+    name          = "compute-a2-cpus-massive-test-02"
+  }
+]
+
+
