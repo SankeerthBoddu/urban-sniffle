@@ -1,0 +1,41 @@
+resource "google_cloud_quotas_quota_preference" "preference" {
+  for_each      = local.consumer_quotas
+  parent        = "projects/${var.project_id}"
+  service       = each.value.service
+  quota_id      = each.value.quota_id
+  contact_email = each.value.contact_email
+  
+  # FIX: safely handle null dimensions map
+  dimensions    = try(length(each.value.dimension), 0) > 0 ? each.value.dimension : null
+  
+  name          = each.value.name
+
+  quota_config {
+    preferred_value = each.value.value
+  }
+}
+
+locals {
+  consumer_quotas = { for index, quota in var.consumer_quotas : "${quota.service}-${quota.name}" => quota }
+}
+
+
+
+# --- Improved Unified Output ---
+
+# STATUS TRACKING DETAILS:
+# - Auto-Approved Quotas: If GCP instantly approves the request, `granted_value` will show the new limit and `status` will be blank.
+# - Manual Review Quotas: If the quota requires Google Support review (e.g. A2 CPUs), Terraform will NOT 
+#   block forever. It finishes execution, assigns a `request_number` (GCP trace_id) which is the GCP ticket, 
+#   and places a message in `status` (state_detail) like "Pending Google Support Approval".
+output "quota_override_details" {
+  description = "A comprehensive map of quota overrides including ID, trace ID (request number), and status."
+  value = {
+    for k, v in google_cloud_quotas_quota_preference.preference : k => {
+      id             = v.id
+      request_number = try(v.quota_config[0].trace_id, null)
+      status         = try(v.quota_config[0].state_detail, null)
+      granted_value  = try(v.quota_config[0].granted_value, null)
+    }
+  }
+}
