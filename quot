@@ -1,127 +1,20 @@
-resource "google_cloud_quotas_quota_preference" "preference" {
-  for_each      = local.consumer_quotas
-  parent        = "projects/${var.project_id}"
-  service       = each.value.service
-  quota_id      = each.value.quota_id
-  contact_email = each.value.contact_email
-  
-  # FIX: safely handle null dimensions map
-  dimensions    = try(length(each.value.dimension), 0) > 0 ? each.value.dimension : null
-  
-  name          = each.value.name
+Quota Module Integration Notes
+Here's a quick breakdown of how the new quota module works, how it processes statuses, and how we're using it in the pipeline.
 
-  quota_config {
-    preferred_value = each.value.value
-  }
-}
+How the module works
+Instead of doing manual click-ops in the GCP console, we built tf-mod-quota-management to talk directly to the Google Cloud Quotas API. You pass it a list of quotas (with or without specific regions), and it formats them into valid API requests and shoots them off to Google.
 
-locals {
-  consumer_quotas = { for index, quota in var.consumer_quotas : "${quota.service}-${quota.name}" => quota }
-}
+Avoiding the "Decrease" Error
+Earlier we saw an error about LIMIT_DECREASE_BELOW_USAGE. GCP throws this whenever it thinks you are trying to lower your quota below your default project limits. To get around this without adding complicated permission workarounds, we just make sure the quota values we request are always higher than the organization defaults. As long as it's an increase, the request goes through cleanly.
 
+How we calculate the status
+Quota requests aren't always instant—they happen in the background. To give our DTO a clean status to read, we added a small piece of logic to the Terraform outputs that looks at Google's response and translates it:
 
+PROCESSING: Google's API says reconciling = true. They are still actively thinking about the request.
+APPLIED: Google says reconciling is done, and the quota we actually got matches the quota we asked for. Basically, it was auto-approved.
+PENDING_GCP_REVIEW: Reconciling is done, but the numbers don't match. This happens when a request is so big (like 15,000 A2 CPUs) that it gets dumped into a manual review queue at Google. In this case, we also capture the request_number so we have the actual Google support ticket ID.
+The Two-Pass Pipeline Strategy
+Because our infra pipeline already runs twice, we get to use that to our advantage to handle the delay:
 
-# --- Improved Unified Output ---
-
-# STATUS TRACKING DETAILS:
-# - Auto-Approved Quotas: If GCP instantly approves the request, `granted_value` will show the new limit and `status` will be blank.
-# - Manual Review Quotas: If the quota requires Google Support review (e.g. A2 CPUs), Terraform will NOT 
-#   block forever. It finishes execution, assigns a `request_number` (GCP trace_id) which is the GCP ticket, 
-#   and places a message in `status` (state_detail) like "Pending Google Support Approval".
-output "quota_override_details" {
-  description = "A comprehensive map of quota overrides including ID, trace ID (request number), and status."
-  value = {
-    for k, v in google_cloud_quotas_quota_preference.preference : k => {
-      id             = v.id
-      request_number = try(v.quota_config[0].trace_id, null)
-      raw_status     = try(v.quota_config[0].state_detail, null)
-      granted_value  = try(v.quota_config[0].granted_value, null)
-      
-      # --- Usable Actionable Checks ---
-      # Evaluates if the value granted by the API matches what we requested
-      is_updated     = tostring(try(v.quota_config[0].granted_value, "")) == tostring(try(v.quota_config[0].preferred_value, "unmatched"))
-      
-      # Clear ENUM style status for your CloudHub/DTO parsing
-      summary_status = try(v.reconciling, false) ? "PROCESSING" : (
-        tostring(try(v.quota_config[0].granted_value, "")) == tostring(try(v.quota_config[0].preferred_value, "unmatched")) ? "APPLIED" : "PENDING_GCP_REVIEW"
-      )
-    }
-  }
-}
-
-
-Now, for every quota passed in, the map will provide:
-
-is_updated: A simple true/false boolean. I implemented this by actively evaluating if the value Google has granted identically matches the value you preferred.
-summary_status: A clean string ENUM that your frontend / portal can parse smoothly.
-"PROCESSING" (if Terraform is actively talking to the backend)
-"APPLIED" (if granted == preferred)
-"PENDING_GCP_REVIEW" (if the value hasn't updated yet, meaning a ticket was automatically cut off to Google Support)
-This makes verifying quota enablement incredibly precise without relying on unstable string processing!
-
-consumer_quotas = [
-  # ---------------------------------------------------------------------------------
-  # TEST 1: AUTO-APPROVED ("APPLIED")
-  # Requesting a very small, standard N1/E2 CPU quota increase. GCP's automated 
-  # systems typically evaluate this instantly, granting the value immediately without
-  # generating a support ticket.
-  # Expected Output: is_updated = true, summary_status = "APPLIED"
-  # ---------------------------------------------------------------------------------
-  {
-    service       = "compute.googleapis.com"
-    dimension     = { region = "us-west3" }
-    quota_id      = "CPUS-per-project-region"   # Standard CPUs
-    value         = 12                         # Small limit
-    contact_email = "pinki.mandal@citi.com"
-    name          = "compute-cpus-standard-test-01"
-  },
-  
-  # ---------------------------------------------------------------------------------
-  # TEST 2: MANUAL REVIEW ("PENDING_GCP_REVIEW")
-  # Requesting massive amounts of A2 CPUs (scarce, GPU-bound hardware). This will 
-  # absolutely trip Google's risk/capacity checks, requiring human review. It will 
-  # finish Terraform execution, but leave the quota state pending.
-  # Expected Output: is_updated = false, summary_status = "PENDING_GCP_REVIEW", request_number = "trace_id_ticket_xyz"
-  # ---------------------------------------------------------------------------------
-  {
-    service       = "compute.googleapis.com"
-    dimension     = { region = "us-west3" }
-    quota_id      = "A2-CPUS-per-project-region" # Highly restricted A2 resources
-    value         = 500                          # Massive request
-    contact_email = "pinki.mandal@citi.com"
-    name          = "compute-a2-cpus-massive-test-02"
-  }
-]
-
-
-quota_override_details = {
-  
-  # ----------------------------------------------------------------------
-  # TEST 1: The Standard Quota (Auto-Approved Instantly)
-  # ----------------------------------------------------------------------
-  "compute.googleapis.com-compute-cpus-standard-test-01" = {
-    id             = "projects/gcp-svc-a02e397a-quotatest/locations/global/quotaPreferences/compute-cpus-standard-test-01"
-    
-    granted_value  = "12"          # Successfully updated to match our request
-    is_updated     = true          # Match confirmed
-    summary_status = "APPLIED"     # The clear flag for your portal
-    
-    # These remain empty because Google didn't need to open a support ticket
-    request_number = null          
-    raw_status     = null          
-  }
-  # ----------------------------------------------------------------------
-  # TEST 2: The Massive A2 GPU Quota (Pushed to GCP Manual Review)
-  # ----------------------------------------------------------------------
-  "compute.googleapis.com-compute-a2-cpus-massive-test-02" = {
-    id             = "projects/gcp-svc-a02e397a-quotatest/locations/global/quotaPreferences/compute-a2-cpus-massive-test-02"
-    
-    granted_value  = "0"                  # Remains the original value until a human at Google approves it
-    is_updated     = false               # Values do not match yet
-    summary_status = "PENDING_GCP_REVIEW" # The clear flag for your portal
-    
-    # Google cut a ticket to their capacity team, providing us the tracking data
-    request_number = "1abc2345-678d-90ef-gh12-34ijkl5678mn" 
-    raw_status     = "UNDER_REVIEW: Your request is pending manual review by Google."  
-  }
-}
+First Pipeline Run: Terraform submits the quotas. Google says "we're working on it." Terraform outputs PROCESSING, and the DTO records that.
+Second Pipeline Run: A few minutes later, the pipeline runs again. Terraform automatically checks Google for an update. By now, Google is usually done, so Terraform calculates the new status and outputs either APPLIED or PENDING_GCP_REVIEW. The DTO grabs this updated state and pushes the final result.
